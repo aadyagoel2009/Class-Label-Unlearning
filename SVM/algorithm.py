@@ -181,10 +181,10 @@ def train_shadow_attack(theta_target, vectorizer, train_docs: list, train_labels
     attack_clf.fit(X_att, y_att)
     return attack_clf
 
-def train_shadow_attack_with_unlearning(theta_target, vectorizer, train_docs: list, train_labels: np.ndarray, C: float, mask_cls: int):
+def train_shadow_attack_with_unlearning(theta_target, vectorizer, train_docs: list, train_labels: np.ndarray, C: float, class_to_unlearn: int):
     """
     Exactly the same as train_shadow_attack, but *inside* each shadow
-    you also remove class `mask_cls` and fine-tune—just like the real pipeline.
+    you also remove class `class_to_unlearn` and fine-tune—just like the real pipeline.
     """
     # split into shadow‐train vs holdout
     s_docs, h_docs, s_lbls, h_lbls = train_test_split(
@@ -196,8 +196,8 @@ def train_shadow_attack_with_unlearning(theta_target, vectorizer, train_docs: li
     # train LS-SVM on shadow-train
     theta_sh = train_ls_svm(Xs, s_lbls, C)
 
-    # unlearn mask_cls in the shadow model
-    rem = np.where(s_lbls == mask_cls)[0]
+    # unlearn class_to_unlearn in the shadow model
+    rem = np.where(s_lbls == class_to_unlearn)[0]
     theta_sh_un = influence_removal_ls_svm(Xs, s_lbls, theta_sh, rem, C)
 
     # fine-tune on remaining shadow-train
@@ -216,7 +216,7 @@ def train_shadow_attack_with_unlearning(theta_target, vectorizer, train_docs: li
     ft.classes_ = classes_red
     ft.fit(Xs_red, y_sred)
 
-    # reconstruct full K×d shadow weight matrix (freeze mask_cls row=0)
+    # reconstruct full K×d shadow weight matrix (freeze class_to_unlearn row=0)
     K, d = theta_sh.shape
     theta_sh_final = np.zeros((K, d))
     for i, c in enumerate(classes_red):
@@ -281,21 +281,21 @@ def main():
     train_docs, test_docs, y_train, y_test = prepare_data()
     vectorizer, X_train, X_test = build_tfidf(train_docs, test_docs)
 
-    mask_cls = random.randint(0, max(y_train))
-    C = 100.0
+    class_to_unlearn = random.randint(0, max(y_train))
+    C = 10.0
 
     # baseline training & attack
     theta_orig = train_ls_svm(X_train, y_train, C)
     acc_before = evaluate_accuracy(theta_orig, vectorizer, test_docs, y_test)
     attack_clf = train_shadow_attack(theta_orig, vectorizer, train_docs, y_train, C)
     auc_before = compute_mia_auc(attack_clf, theta_orig, vectorizer, train_docs, y_train, test_docs,  y_test)
-    auc_before_cls = compute_class_mia_auc(attack_clf, theta_orig, vectorizer, train_docs, y_train, test_docs,  y_test, cls=mask_cls)
+    auc_before_cls = compute_class_mia_auc(attack_clf, theta_orig, vectorizer, train_docs, y_train, test_docs,  y_test, cls=class_to_unlearn)
 
-    # unlearning class mask_cls
-    removal_indices = np.where(y_train == mask_cls)[0]
+    # unlearning class class_to_unlearn
+    removal_indices = np.where(y_train == class_to_unlearn)[0]
     theta_un = influence_removal_ls_svm(X_train, y_train, theta_orig, removal_indices, C)
 
-    # fine-tune on reduced set (freeze mask_cls row)
+    # fine-tune on reduced set (freeze class_to_unlearn row)
     keep_mask = np.ones(len(y_train), bool)
     keep_mask[removal_indices] = False
     X_red, y_red = X_train[keep_mask], y_train[keep_mask]
@@ -318,19 +318,24 @@ def main():
         theta_final[cls, :] = ft.coef_[i]
 
     # retrain the attack on new model
-    attack_clf = train_shadow_attack_with_unlearning(theta_final, vectorizer, train_docs, y_train, C, mask_cls)
+    attack_clf = train_shadow_attack_with_unlearning(theta_final, vectorizer, train_docs, y_train, C, class_to_unlearn)
 
     acc_after = evaluate_accuracy(theta_final, vectorizer, test_docs, y_test)
     auc_after = compute_mia_auc(attack_clf, theta_final, vectorizer, train_docs, y_train, test_docs,  y_test)
-    auc_after_cls = compute_class_mia_auc(attack_clf, theta_final, vectorizer, train_docs, y_train, test_docs,  y_test, cls=mask_cls)
+    auc_after_cls = compute_class_mia_auc(attack_clf, theta_final, vectorizer, train_docs, y_train, test_docs,  y_test, cls=class_to_unlearn)
+    
+    test_keep_idx = np.where(y_test != class_to_unlearn)[0]
+    test_docs_wo = [test_docs[i] for i in test_keep_idx]
+    y_test_wo = y_test[test_keep_idx]
+    acc_after_wo_unlearned = evaluate_accuracy(theta_final, vectorizer, test_docs_wo, y_test_wo)
 
-    print(f"Class label unlearned: {mask_cls}")
+    print(f"Class label unlearned: {class_to_unlearn}")
     print(f"Accuracy before unlearning: {acc_before:.4f}")
     print(f"MIA AUC before unlearning: {auc_before:.4f}")
-    print(f"MIA AUC before unlearning (class {mask_cls}): {auc_before_cls:.4f}\n")
-    print(f"Accuracy after unlearning: {acc_after:.4f}")
+    print(f"MIA AUC before unlearning (class {class_to_unlearn}): {auc_before_cls:.4f}\n")
+    print(f"Accuracy after unlearning: {acc_after_wo_unlearned:.4f}")
     print(f"Overall MIA AUC after unlearning: {auc_after:.4f}")
-    print(f"MIA AUC after unlearning (class {mask_cls}): {auc_after_cls:.4f}")
+    print(f"MIA AUC after unlearning (class {class_to_unlearn}): {auc_after_cls:.4f}")
 
 if __name__ == "__main__":
     main()
