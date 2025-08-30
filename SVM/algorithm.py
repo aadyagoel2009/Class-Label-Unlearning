@@ -7,6 +7,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
+import matplotlib.pyplot as plt
 
 def prepare_data(test_size: float = 0.2, random_state: int = 42):
     """
@@ -287,9 +288,9 @@ def main():
     # baseline training & attack
     theta_orig = train_ls_svm(X_train, y_train, C)
     acc_before = evaluate_accuracy(theta_orig, vectorizer, test_docs, y_test)
-    attack_clf = train_shadow_attack(theta_orig, vectorizer, train_docs, y_train, C)
-    auc_before = compute_mia_auc(attack_clf, theta_orig, vectorizer, train_docs, y_train, test_docs,  y_test)
-    auc_before_cls = compute_class_mia_auc(attack_clf, theta_orig, vectorizer, train_docs, y_train, test_docs,  y_test, cls=class_to_unlearn)
+    attack_clf_before = train_shadow_attack(theta_orig, vectorizer, train_docs, y_train, C)
+    auc_before = compute_mia_auc(attack_clf_before, theta_orig, vectorizer, train_docs, y_train, test_docs,  y_test)
+    auc_before_cls = compute_class_mia_auc(attack_clf_before, theta_orig, vectorizer, train_docs, y_train, test_docs,  y_test, cls=class_to_unlearn)
 
     # unlearning class class_to_unlearn
     removal_indices = np.where(y_train == class_to_unlearn)[0]
@@ -318,11 +319,11 @@ def main():
         theta_final[cls, :] = ft.coef_[i]
 
     # retrain the attack on new model
-    attack_clf = train_shadow_attack_with_unlearning(theta_final, vectorizer, train_docs, y_train, C, class_to_unlearn)
+    attack_clf_after = train_shadow_attack_with_unlearning(theta_final, vectorizer, train_docs, y_train, C, class_to_unlearn)
 
     acc_after = evaluate_accuracy(theta_final, vectorizer, test_docs, y_test)
-    auc_after = compute_mia_auc(attack_clf, theta_final, vectorizer, train_docs, y_train, test_docs,  y_test)
-    auc_after_cls = compute_class_mia_auc(attack_clf, theta_final, vectorizer, train_docs, y_train, test_docs,  y_test, cls=class_to_unlearn)
+    auc_after = compute_mia_auc(attack_clf_after, theta_final, vectorizer, train_docs, y_train, test_docs,  y_test)
+    auc_after_cls = compute_class_mia_auc(attack_clf_after, theta_final, vectorizer, train_docs, y_train, test_docs,  y_test, cls=class_to_unlearn)
     
     test_keep_idx = np.where(y_test != class_to_unlearn)[0]
     test_docs_wo = [test_docs[i] for i in test_keep_idx]

@@ -278,58 +278,83 @@ def compute_class_mia_auc(attack_clf, theta, vectorizer, train_docs, train_label
         docs_te_k, labs_te_k
     )
 
-def reclassification_distribution(theta, vectorizer, docs, labels, class_id):
+def summarize_vector(arr):
+    if len(arr) == 0:
+        return {"n": 0}
+    q25, q50, q75 = np.percentile(arr, [25, 50, 75])
+    return {"n": int(len(arr)), "mean": float(np.mean(arr)), "std": float(np.std(arr)),
+            "p25": float(q25), "median": float(q50), "p75": float(q75),
+            "min": float(np.min(arr)), "max": float(np.max(arr))}
+
+def tfidf_distributions_for_class(vectorizer, docs, labels, class_id):
     """
-    For all docs whose TRUE label == class_id, compute the distribution of
-    predicted labels under 'theta'.
-
-    Inputs:
-      - theta: np.ndarray (n_classes x n_features)
-      - vectorizer: fitted TfidfVectorizer
-      - docs: list[str]
-      - labels: np.ndarray
-      - class_id: int (the class we unlearned)
-
-    Outputs:
-      - dist: list of (dest_class, count, frac) sorted by count desc
-      - preds: np.ndarray of predicted classes for those docs
-      - idx: np.ndarray of indices of those docs inside 'docs'
+    Summarize TF–IDF inputs (which do not change after unlearning).
+    Returns per-doc sparsity and L2 norm stats for the selected class.
     """
     idx = np.where(labels == class_id)[0]
     if len(idx) == 0:
-        return [], np.array([], dtype=int), idx
+        return {"n_docs": 0}
+
+    docs_k = [docs[i] for i in idx]
+    Xk = vectorizer.transform(docs_k)
+    nnz = np.diff(Xk.indptr)                                  # nonzeros per doc
+    l2  = np.sqrt(Xk.multiply(Xk).sum(axis=1)).A1             # L2 norm per doc
+    return {
+        "n_docs": int(Xk.shape[0]),
+        "nnz_per_doc": summarize_vector(nnz),
+        "l2_norm_per_doc": summarize_vector(l2)
+    }
+
+def top_weighted_terms_for_class(vectorizer, theta, class_id, docs, labels, top_k=20):
+    """
+    Report top-|weight| terms for this class, with mean TF–IDF inside vs outside the class.
+    """
+    feature_names = vectorizer.get_feature_names_out()
+    w = theta[class_id]                                       # weights for this class
+    top_idx = np.argsort(np.abs(w))[-min(top_k, len(w)) :][::-1]
+
+    idx_in  = np.where(labels == class_id)[0]
+    idx_out = np.where(labels != class_id)[0]
+    Xin  = vectorizer.transform([docs[i] for i in idx_in])    # inputs don’t change after unlearning
+    Xout = vectorizer.transform([docs[i] for i in idx_out])
+    mean_in  = np.asarray(Xin.mean(axis=0)).ravel()
+    mean_out = np.asarray(Xout.mean(axis=0)).ravel()
+
+    rows = []
+    for j in top_idx:
+        rows.append( (feature_names[j], float(w[j]), float(mean_in[j]), float(mean_out[j])) )
+    return rows
+
+def model_signal_distributions_for_class(theta, vectorizer, docs, labels, class_id):
+    """
+    Model-side signals that DO change after unlearning, evaluated on docs of class_id:
+    - prob of that class, entropy, top-2 gap, and the logit for the removed class row.
+    """
+    idx = np.where(labels == class_id)[0]
+    if len(idx) == 0:
+        return {}
     X = vectorizer.transform([docs[i] for i in idx])
-    scores = X @ theta.T
-    preds = np.argmax(scores, axis=1)
-    unique, counts = np.unique(preds, return_counts=True)
-    total = len(idx)
-    dist = sorted([(int(c), int(n), float(n/total)) for c, n in zip(unique, counts)],
-                  key=lambda t: t[1], reverse=True)
-    return dist, preds, idx
+    Z = X @ theta.T
+    P = softmax(Z, axis=1)
 
-def print_reclassification(dist, class_id, title):
-    print(f"\n[{title}] Reclassification of true class {class_id} (dest | count | frac)")
-    for c, n, f in dist:
-        print(f"  -> {c:2d} | {n:4d} | {f:6.3f}")
+    true_prob = P[:, class_id]
+    entropy   = -np.sum(P * np.log(P + 1e-12), axis=1)
+    top2      = np.sort(P, axis=1)[:, -2:]
+    gap       = top2[:, 1] - top2[:, 0]
+    logit_k   = np.asarray(Z[:, class_id]).ravel()
 
-def plot_reclassification_bar(dist, class_id, title):
-    if not dist:
-        return
-    classes = [d[0] for d in dist]
-    counts  = [d[1] for d in dist]
-    plt.figure(figsize=(8,4))
-    plt.bar([str(c) for c in classes], counts)
-    plt.title(f"{title}: where class {class_id} docs go")
-    plt.xlabel("Predicted class")
-    plt.ylabel("# docs")
-    plt.tight_layout()
-    plt.show()
+    return {
+        "true_prob":        summarize_vector(true_prob),
+        "entropy":          summarize_vector(entropy),
+        "top2_gap":         summarize_vector(gap),
+        "logit_removedrow": summarize_vector(logit_k),
+    }
 
 def main():
     train_docs, test_docs, y_train, y_test = prepare_data()
     vectorizer, X_train, X_test = build_tfidf(train_docs, test_docs)
 
-    class_to_unlearn = 0
+    class_to_unlearn = random.randint(0, max(y_train))
     C = 10.0
 
     # baseline training & attack
@@ -385,24 +410,34 @@ def main():
     print(f"Overall MIA AUC after unlearning: {auc_after:.4f}")
     print(f"MIA AUC after unlearning (class {class_to_unlearn}): {auc_after_cls:.4f}")
 
-    dist_before_test, _, _ = reclassification_distribution(
-        theta_orig, vectorizer, test_docs, y_test, class_to_unlearn
-    )
-    dist_after_test,  _, _ = reclassification_distribution(
-        theta_final, vectorizer, test_docs, y_test, class_to_unlearn
-    )
-    print_reclassification(dist_before_test, class_to_unlearn, title="BEFORE")
-    print_reclassification(dist_after_test,  class_to_unlearn, title="AFTER")
-    plot_reclassification_bar(dist_after_test, class_to_unlearn, title="AFTER (test)")
+    tfidf_stats_before = tfidf_distributions_for_class(vectorizer, train_docs, y_train, class_to_unlearn)
+    tfidf_stats_after  = tfidf_distributions_for_class(vectorizer, train_docs, y_train, class_to_unlearn)  # identical by design
 
-    dist_before_train, _, _ = reclassification_distribution(
-        theta_orig, vectorizer, train_docs, y_train, class_to_unlearn
-    )
-    dist_after_train,  _, _ = reclassification_distribution(
-        theta_final, vectorizer, train_docs, y_train, class_to_unlearn
-    )
-    print_reclassification(dist_before_train, class_to_unlearn, title="BEFORE (train)")
-    print_reclassification(dist_after_train,  class_to_unlearn, title="AFTER  (train)")
+    print("\n[TF–IDF input distributions for removed class (should be identical before/after)]")
+    print(" before:", tfidf_stats_before)
+    print("  after:", tfidf_stats_after)
+
+    # Top weighted terms for the removed class (weights from BEFORE unlearning)
+    top_terms = top_weighted_terms_for_class(vectorizer, theta_orig, class_to_unlearn, train_docs, y_train, top_k=15)
+    print("\n[Top-|weight| terms for removed class (before unlearning)]")
+    print(" term | weight | mean TF–IDF in-class | mean TF–IDF out-of-class")
+    for term, wj, mi, mo in top_terms:
+        print(f"  {term:30s} | {wj:+.3e} | {mi:.3e} | {mo:.3e}")
+
+    # === Model-side signal distributions (these DO change) ===
+    signals_train_before = model_signal_distributions_for_class(theta_orig,  vectorizer, train_docs, y_train, class_to_unlearn)
+    signals_train_after  = model_signal_distributions_for_class(theta_final, vectorizer, train_docs, y_train, class_to_unlearn)
+    signals_test_before  = model_signal_distributions_for_class(theta_orig,  vectorizer, test_docs,  y_test,  class_to_unlearn)
+    signals_test_after   = model_signal_distributions_for_class(theta_final, vectorizer, test_docs,  y_test,  class_to_unlearn)
+
+    print("\n[Model signals on removed-class TRAIN docs]")
+    print(" before:", signals_train_before)
+    print("  after:", signals_train_after)
+
+    print("\n[Model signals on removed-class TEST docs]")
+    print(" before:", signals_test_before)
+    print("  after:", signals_test_after)
+
 
 if __name__ == "__main__":
     main()

@@ -278,50 +278,53 @@ def compute_class_mia_auc(attack_clf, theta, vectorizer, train_docs, train_label
         docs_te_k, labs_te_k
     )
 
-def reclassification_distribution(theta, vectorizer, docs, labels, class_id):
-    """
-    For all docs whose TRUE label == class_id, compute the distribution of
-    predicted labels under 'theta'.
+def mia_scores_for_class(attack_clf, theta_weights, vectorizer,
+                         train_docs, train_labels, test_docs, test_labels,
+                         class_id):
+    """Return attack scores (P(member)) for this class: train=members, test=nonmembers."""
+    tr_idx = np.where(train_labels == class_id)[0]
+    te_idx = np.where(test_labels  == class_id)[0]
+    docs_tr = [train_docs[i] for i in tr_idx]
+    docs_te = [test_docs[i]  for i in te_idx]
+    y_tr = train_labels[tr_idx]
+    y_te = test_labels[te_idx]
 
-    Inputs:
-      - theta: np.ndarray (n_classes x n_features)
-      - vectorizer: fitted TfidfVectorizer
-      - docs: list[str]
-      - labels: np.ndarray
-      - class_id: int (the class we unlearned)
+    Xtr = vectorizer.transform(docs_tr)
+    Xte = vectorizer.transform(docs_te)
+    Ptr = softmax(Xtr @ theta_weights.T, axis=1)
+    Pte = softmax(Xte @ theta_weights.T, axis=1)
 
-    Outputs:
-      - dist: list of (dest_class, count, frac) sorted by count desc
-      - preds: np.ndarray of predicted classes for those docs
-      - idx: np.ndarray of indices of those docs inside 'docs'
-    """
-    idx = np.where(labels == class_id)[0]
-    if len(idx) == 0:
-        return [], np.array([], dtype=int), idx
-    X = vectorizer.transform([docs[i] for i in idx])
-    scores = X @ theta.T
-    preds = np.argmax(scores, axis=1)
-    unique, counts = np.unique(preds, return_counts=True)
-    total = len(idx)
-    dist = sorted([(int(c), int(n), float(n/total)) for c, n in zip(unique, counts)],
-                  key=lambda t: t[1], reverse=True)
-    return dist, preds, idx
+    A_tr = build_attack_features(Ptr, y_tr)
+    A_te = build_attack_features(Pte, y_te)
 
-def print_reclassification(dist, class_id, title):
-    print(f"\n[{title}] Reclassification of true class {class_id} (dest | count | frac)")
-    for c, n, f in dist:
-        print(f"  -> {c:2d} | {n:4d} | {f:6.3f}")
+    s_tr = attack_clf.predict_proba(A_tr)[:, 1]
+    s_te = attack_clf.predict_proba(A_te)[:, 1]
+    return s_tr, s_te
 
-def plot_reclassification_bar(dist, class_id, title):
-    if not dist:
-        return
-    classes = [d[0] for d in dist]
-    counts  = [d[1] for d in dist]
-    plt.figure(figsize=(8,4))
-    plt.bar([str(c) for c in classes], counts)
-    plt.title(f"{title}: where class {class_id} docs go")
-    plt.xlabel("Predicted class")
-    plt.ylabel("# docs")
+def summarize(arr):
+    if len(arr) == 0:
+        return {"n": 0}
+    q25, q50, q75 = np.percentile(arr, [25, 50, 75])
+    return {
+        "n": int(len(arr)),
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "p25": float(q25), "median": float(q50), "p75": float(q75),
+        "min": float(np.min(arr)), "max": float(np.max(arr))
+    }
+
+def plot_mia_score_hists(s_tr_before, s_te_before, s_tr_after, s_te_after, class_id):
+    """Four histograms: before/after × members/nonmembers."""
+    bins = np.linspace(0, 1, 41)
+    plt.figure(figsize=(10,6))
+    plt.hist(s_tr_before, bins=bins, alpha=0.45, label="before: members")
+    plt.hist(s_te_before, bins=bins, alpha=0.45, label="before: non-members")
+    plt.hist(s_tr_after,  bins=bins, alpha=0.45, label="after: members")
+    plt.hist(s_te_after,  bins=bins, alpha=0.45, label="after: non-members")
+    plt.xlabel("Attack score P(member)")
+    plt.ylabel("Count")
+    plt.title(f"MIA score distributions for class {class_id}")
+    plt.legend()
     plt.tight_layout()
     plt.show()
 
@@ -329,7 +332,7 @@ def main():
     train_docs, test_docs, y_train, y_test = prepare_data()
     vectorizer, X_train, X_test = build_tfidf(train_docs, test_docs)
 
-    class_to_unlearn = 0
+    class_to_unlearn = random.randint(0, max(y_train))
     C = 10.0
 
     # baseline training & attack
@@ -385,24 +388,29 @@ def main():
     print(f"Overall MIA AUC after unlearning: {auc_after:.4f}")
     print(f"MIA AUC after unlearning (class {class_to_unlearn}): {auc_after_cls:.4f}")
 
-    dist_before_test, _, _ = reclassification_distribution(
-        theta_orig, vectorizer, test_docs, y_test, class_to_unlearn
+    scores_tr_before, scores_te_before = mia_scores_for_class(
+        attack_clf_before, theta_orig, vectorizer,
+        train_docs, y_train, test_docs, y_test,
+        class_id=class_to_unlearn
     )
-    dist_after_test,  _, _ = reclassification_distribution(
-        theta_final, vectorizer, test_docs, y_test, class_to_unlearn
+    scores_tr_after, scores_te_after = mia_scores_for_class(
+        attack_clf_after, theta_final, vectorizer,
+        train_docs, y_train, test_docs, y_test,
+        class_id=class_to_unlearn
     )
-    print_reclassification(dist_before_test, class_to_unlearn, title="BEFORE")
-    print_reclassification(dist_after_test,  class_to_unlearn, title="AFTER")
-    plot_reclassification_bar(dist_after_test, class_to_unlearn, title="AFTER (test)")
 
-    dist_before_train, _, _ = reclassification_distribution(
-        theta_orig, vectorizer, train_docs, y_train, class_to_unlearn
+    print("\n[MIA score distributions | class {}]".format(class_to_unlearn))
+    print(" before | members    :", summarize(scores_tr_before))
+    print(" before | nonmembers :", summarize(scores_te_before))
+    print("  after | members    :", summarize(scores_tr_after))
+    print("  after | nonmembers :", summarize(scores_te_after))
+
+    # Optional: visualize the four distributions
+    plot_mia_score_hists(
+        scores_tr_before, scores_te_before,
+        scores_tr_after,  scores_te_after,
+        class_to_unlearn
     )
-    dist_after_train,  _, _ = reclassification_distribution(
-        theta_final, vectorizer, train_docs, y_train, class_to_unlearn
-    )
-    print_reclassification(dist_before_train, class_to_unlearn, title="BEFORE (train)")
-    print_reclassification(dist_after_train,  class_to_unlearn, title="AFTER  (train)")
 
 if __name__ == "__main__":
     main()
