@@ -278,65 +278,230 @@ def compute_class_mia_auc(attack_clf, theta, vectorizer, train_docs, train_label
         docs_te_k, labs_te_k
     )
 
-def main():
-    train_docs, test_docs, y_train, y_test = prepare_data()
-    vectorizer, X_train, X_test = build_tfidf(train_docs, test_docs)
+from sklearn.preprocessing import normalize
 
-    class_to_unlearn = random.randint(0, max(y_train))
-    C = 10.0
+def logistic_loss_and_grad(theta_weights, X, y, classes, C):
+    """
+    Multinomial logistic loss (1-vs-rest softmax) on reduced set + L2 (1/C).
+    theta_weights: (K_active x d) numpy array for the active classes in `classes`
+    X: sparse CSR (n x d) or dense (n x d)
+    y: (n,) labels from the global label space
+    classes: sorted unique labels present in this reduced set (length K_active)
+    C: same C you use elsewhere (L2 strength is 1/C)
+    """
+    # map y to 0..K_active-1 for rows that are present
+    class_to_row = {c:i for i,c in enumerate(classes)}
+    y_local = np.array([class_to_row[yi] for yi in y])
 
-    # baseline training & attack
+    # scores and probabilities
+    if hasattr(X, "tocsr"):
+        S = X @ theta_weights.T           # (n x K)
+    else:
+        S = X.dot(theta_weights.T)
+    S = S - S.max(axis=1, keepdims=True)  # numerical stability
+    P = np.exp(S); P /= P.sum(axis=1, keepdims=True)
+
+    # loss
+    n = X.shape[0]
+    row_idx = np.arange(n)
+    loglik = -np.log(P[row_idx, y_local] + 1e-12).sum()
+    l2 = 0.5 * (theta_weights**2).sum() / C
+    loss = loglik + l2
+
+    # gradient wrt theta (K x d)
+    R = P
+    R[row_idx, y_local] -= 1.0
+    if hasattr(X, "tocsr"):
+        grad = (R.T @ X)                  # (K x d), stays sparse*dense -> dense
+        grad = np.asarray(grad)           # ensure ndarray
+    else:
+        grad = R.T.dot(X)
+    grad /= 1.0                           # (no averaging; matches loss scaling)
+    grad += theta_weights / C
+    return float(loss), grad
+
+def cosine(u, v, eps=1e-12):
+    uu = np.linalg.norm(u); vv = np.linalg.norm(v)
+    if uu < eps or vv < eps: return 0.0
+    return float(np.dot(u, v) / (uu*vv))
+
+def vectorize_theta(theta_matrix):
+    """Flatten K x d weights to a single vector."""
+    return theta_matrix.ravel()
+
+def fine_tune_with_logging(theta_init, X_red, y_red, classes_red, C,
+                           max_bursts=30, inner_max_iter=20,
+                           tol_grad=1e-3, tol_rel=1e-6, verbose=False):
+    """
+    Repeated warm-start LBFGS bursts with gradient/loss logging and stopping on:
+      (i) ||grad||_2 < tol_grad  OR  (ii) relative loss improvement < tol_rel
+    Returns theta_final, loss_hist, grad_hist, converged.
+    """
+    # initialize a multinomial logistic model on the active classes
+    ft = LogisticRegression(
+        penalty='l2', C=C, solver='lbfgs', multi_class='multinomial',
+        fit_intercept=False, warm_start=True, max_iter=inner_max_iter,
+        random_state=42
+    )
+    ft.classes_ = classes_red
+    ft.coef_ = theta_init.copy()
+
+    loss_hist, grad_hist = [], []
+    prev_loss = None
+    converged = False
+
+    for b in range(max_bursts+1):
+        # evaluate current loss/grad
+        loss, grad = logistic_loss_and_grad(ft.coef_, X_red, y_red, classes_red, C)
+        gnorm = float(np.linalg.norm(grad))
+        loss_hist.append(loss); grad_hist.append(gnorm)
+
+        if verbose:
+            rel = float('nan') if prev_loss is None else (prev_loss - loss)/max(prev_loss,1.0)
+            print(f"[FT step {b:02d}] loss={loss:.4f} | grad_norm={gnorm:.3e} | rel_impr={rel if not np.isnan(rel) else float('nan'):.3e}")
+
+        # stopping tests (after first evaluation)
+        if prev_loss is not None:
+            rel_impr = (prev_loss - loss)/max(prev_loss, 1.0)
+            if gnorm < tol_grad or rel_impr < tol_rel:
+                converged = True
+                break
+        prev_loss = loss
+
+        # one more LBFGS burst
+        ft.fit(X_red, y_red)
+
+    return ft.coef_.copy(), loss_hist, grad_hist, converged
+
+def run_unlearning_once(train_docs, test_docs, y_train, y_test, vectorizer, C, class_to_unlearn, seed=0,
+                        ft_max_bursts=30, ft_inner=20, tol_grad=1e-3, tol_rel=1e-6, verbose=False):
+    """
+    Your full pipeline for a single (C, seed): returns dict with theta_final,
+    gradient history, last gradient vector, predictions, and convergence flag.
+    """
+    random.seed(seed); np.random.seed(seed)
+
+    # Build full LS-SVM baseline
+    X_train = vectorizer.transform(train_docs)
+    X_test  = vectorizer.transform(test_docs)
     theta_orig = train_ls_svm(X_train, y_train, C)
-    acc_before = evaluate_accuracy(theta_orig, vectorizer, test_docs, y_test)
-    attack_clf_before = train_shadow_attack(theta_orig, vectorizer, train_docs, y_train, C)
-    auc_before = compute_mia_auc(attack_clf_before, theta_orig, vectorizer, train_docs, y_train, test_docs,  y_test)
-    auc_before_cls = compute_class_mia_auc(attack_clf_before, theta_orig, vectorizer, train_docs, y_train, test_docs,  y_test, cls=class_to_unlearn)
 
-    # unlearning class class_to_unlearn
+    # Unlearn indices
     removal_indices = np.where(y_train == class_to_unlearn)[0]
     theta_un = influence_removal_ls_svm(X_train, y_train, theta_orig, removal_indices, C)
 
-    # fine-tune on reduced set (freeze class_to_unlearn row)
-    keep_mask = np.ones(len(y_train), bool)
-    keep_mask[removal_indices] = False
-    X_red, y_red = X_train[keep_mask], y_train[keep_mask]
+    # Reduced set
+    keep = np.ones(len(y_train), bool); keep[removal_indices] = False
+    X_red, y_red = X_train[keep], y_train[keep]
     classes_red = np.unique(y_red)
     theta_init = theta_un[classes_red, :]
 
-    ft = LogisticRegression(
-        penalty='l2', C=C, solver='lbfgs',
-        fit_intercept=False, warm_start=True,
-        max_iter=5, random_state=42
+    # Fine-tune with logging
+    theta_ft, loss_hist, grad_hist, conv = fine_tune_with_logging(
+        theta_init, X_red, y_red, classes_red, C,
+        max_bursts=ft_max_bursts, inner_max_iter=ft_inner,
+        tol_grad=tol_grad, tol_rel=tol_rel, verbose=verbose
     )
-    ft.coef_ = theta_init.copy()
-    ft.classes_ = classes_red
-    ft.fit(X_red, y_red)
 
-    # reconstruct full theta with zero row for removed class
-    n_classes, n_features = theta_orig.shape
+    # Reconstruct full Kxd with zeroed unlearned row
+    K, d = theta_orig.shape
     theta_final = np.zeros_like(theta_orig)
-    for i, cls in enumerate(classes_red):
-        theta_final[cls, :] = ft.coef_[i]
+    for i, c in enumerate(classes_red):
+        theta_final[c] = theta_ft[i]
 
-    # retrain the attack on new model
-    attack_clf_after = train_shadow_attack_with_unlearning(theta_final, vectorizer, train_docs, y_train, C, class_to_unlearn)
+    # Predictions (agreement checks)
+    scores = X_test @ theta_final.T
+    preds  = np.argmax(scores, axis=1)
 
-    acc_after = evaluate_accuracy(theta_final, vectorizer, test_docs, y_test)
-    auc_after = compute_mia_auc(attack_clf_after, theta_final, vectorizer, train_docs, y_train, test_docs,  y_test)
-    auc_after_cls = compute_class_mia_auc(attack_clf_after, theta_final, vectorizer, train_docs, y_train, test_docs,  y_test, cls=class_to_unlearn)
-    
-    test_keep_idx = np.where(y_test != class_to_unlearn)[0]
-    test_docs_wo = [test_docs[i] for i in test_keep_idx]
-    y_test_wo = y_test[test_keep_idx]
-    acc_after_wo_unlearned = evaluate_accuracy(theta_final, vectorizer, test_docs_wo, y_test_wo)
+    # Final gradient vector on reduced set (actual values)
+    _, grad_final = logistic_loss_and_grad(theta_ft, X_red, y_red, classes_red, C)
 
-    print(f"Class label unlearned: {class_to_unlearn}")
-    print(f"Accuracy before unlearning: {acc_before:.4f}")
-    print(f"MIA AUC before unlearning: {auc_before:.4f}")
-    print(f"MIA AUC before unlearning (class {class_to_unlearn}): {auc_before_cls:.4f}\n")
-    print(f"Accuracy after unlearning: {acc_after_wo_unlearned:.4f}")
-    print(f"Overall MIA AUC after unlearning: {auc_after:.4f}")
-    print(f"MIA AUC after unlearning (class {class_to_unlearn}): {auc_after_cls:.4f}")
+    return {
+        "theta_final": theta_final,
+        "theta_ft_active": theta_ft,           # K_active x d
+        "classes_red": classes_red,
+        "loss_hist": np.array(loss_hist),
+        "grad_hist": np.array(grad_hist),
+        "converged": conv,
+        "preds_test": preds,
+        "grad_final_active": grad_final,       # K_active x d
+    }
+
+def analyze_across_C(results_by_C, vectorizer, C_list, report_topk=10):
+    """
+    Print/report:
+      - pairwise cosine of θ_final across C
+      - prediction agreement across C
+      - gradient histograms & top-k gradient coords (by magnitude) at final step
+      - gradient stability between last two bursts (cosine)
+    """
+    # --- θ stability ---
+    thetas = [vectorize_theta(results_by_C[C]["theta_final"]) for C in C_list]
+    print("\n[Parameter stability: cosine(θ_C, θ_C')]")
+    for i, Ci in enumerate(C_list):
+        row = []
+        for j, Cj in enumerate(C_list):
+            row.append(f"{cosine(thetas[i], thetas[j]):.4f}")
+        print(f"C={Ci:<6} : " + "  ".join(row))
+
+    # --- prediction agreement ---
+    preds = [results_by_C[C]["preds_test"] for C in C_list]
+    print("\n[Prediction agreement on test set]")
+    for i, Ci in enumerate(C_list):
+        row = []
+        for j, Cj in enumerate(C_list):
+            agree = (preds[i] == preds[j]).mean()
+            row.append(f"{agree:.4f}")
+        print(f"C={Ci:<6} : " + "  ".join(row))
+
+    # --- gradient diagnostics at final step ---
+    feat_names = vectorizer.get_feature_names_out()
+    print("\n[Final gradient vector stats per C (on reduced set, active classes)]")
+    for C in C_list:
+        G = results_by_C[C]["grad_final_active"]          # (K_active x d)
+        gvec = G.ravel()
+        print(f"  C={C:<6} ||g||2={np.linalg.norm(gvec):.3e}  ||g||inf={np.max(np.abs(gvec)):.3e}")
+
+        # top-k coordinates (show class,row,feature)
+        idx = np.argpartition(np.abs(gvec), -report_topk)[-report_topk:]
+        idx = idx[np.argsort(-np.abs(gvec[idx]))]
+        print("   top-|g_i| features:")
+        Kact, d = G.shape
+        for k in idx:
+            r = k // d
+            f = k % d
+            print(f"     class_row={results_by_C[C]['classes_red'][r]}  feat='{feat_names[f]}'  g={G[r,f]:+.3e}")
+        print()
+
+    # --- gradient stability across bursts (cosine between last two) ---
+    print("[Gradient stability across the last two bursts]")
+    for C in C_list:
+        hist = results_by_C[C]["grad_hist"]
+        # we logged only norms; show end norms and burst count
+        print(f"  C={C:<6} bursts={len(hist)-1}  final_norm={hist[-1]:.3e}  prev_norm={hist[-2] if len(hist)>1 else float('nan'):.3e}")
+
+def main():
+    # --- data & tf-idf ---
+    train_docs, test_docs, y_train, y_test = prepare_data()
+    vectorizer, X_train, X_test = build_tfidf(train_docs, test_docs)
+
+    # choose the same class_to_unlearn across C so releases are comparable
+    class_to_unlearn = random.randint(0, int(y_train.max()))
+
+    C_list = [0.00000000001, 1.0, 3.0, 5.0, 10.0, 30.0, 50.0, 100.0]
+
+    results_by_C = {}
+    for C in C_list:
+        print(f"\n=== Running unlearning with C={C} ===")
+        res = run_unlearning_once(
+            train_docs, test_docs, y_train, y_test, vectorizer, C, class_to_unlearn,
+            seed=0, ft_max_bursts=30, ft_inner=20, tol_grad=1e-3, tol_rel=1e-6, verbose=True
+        )
+        results_by_C[C] = res
+        print(f"   converged={res['converged']}  final grad norm={res['grad_hist'][-1]:.3e}")
+
+    # analyze stability across those C values
+    analyze_across_C(results_by_C, vectorizer, C_list, report_topk=10)
 
 if __name__ == "__main__":
     main()

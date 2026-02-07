@@ -1,5 +1,9 @@
-import numpy as np
+import os
+import csv
 import random
+from typing import Tuple
+
+import numpy as np
 from scipy.special import softmax
 from scipy.sparse.linalg import LinearOperator, cg
 from sklearn.datasets import fetch_20newsgroups
@@ -9,32 +13,29 @@ from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
 import matplotlib.pyplot as plt
 
-def prepare_data_80_10_10(test_size_total: float = 0.2, random_state: int = 42):
+def prepare_data(test_size: float = 0.2, random_state: int = 42):
     """
-    Load 20 Newsgroups data and split into 80/10/10:
-      - train: 80%
-      - test_pre: 10%   (evaluate before unlearning)
-      - test_post: 10%  (evaluate after unlearning)
+    Load 20 Newsgroups data and split into train/test.
+
+    Outputs:
+      - train_texts, test_texts, train_labels, test_labels
     """
     data = fetch_20newsgroups(subset="all")
-    texts, labels = data.data, data.target
-
-    # first: 80/20 (train vs temp)
-    train_texts, temp_texts, train_labels, temp_labels = train_test_split(
-        texts, labels, test_size=test_size_total, random_state=random_state, stratify=labels
+    return train_test_split(
+        data.data,
+        data.target,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=data.target
     )
 
-    # second: split temp 50/50 into two 10% chunks (pre/post), stratified
-    test_pre_texts, test_post_texts, test_pre_labels, test_post_labels = train_test_split(
-        temp_texts, temp_labels, test_size=0.5, random_state=random_state, stratify=temp_labels
-    )
 
-    return (train_texts, test_pre_texts, test_post_texts,
-            np.array(train_labels), np.array(test_pre_labels), np.array(test_post_labels))
-
-def build_tfidf(train_texts: list, test_pre_texts: list, test_post_texts: list):
+def build_tfidf(train_texts: list, test_texts: list):
     """
-    Fit TF-IDF on training texts and transform both test splits.
+    Fit TF-IDF on training texts and transform both splits.
+
+    Outputs:
+      - vectorizer, X_train (sparse), X_test (sparse)
     """
     vectorizer = TfidfVectorizer(
         stop_words="english",
@@ -45,28 +46,41 @@ def build_tfidf(train_texts: list, test_pre_texts: list, test_post_texts: list):
         norm="l2"
     )
     X_train = vectorizer.fit_transform(train_texts)
-    X_test_pre = vectorizer.transform(test_pre_texts)
-    X_test_post = vectorizer.transform(test_post_texts)
-    return vectorizer, X_train, X_test_pre, X_test_post
+    X_test = vectorizer.transform(test_texts)
+    return vectorizer, X_train, X_test
 
 def train_ls_svm(X_train, y_train, C: float = 10.0):
+    """
+    Train a multi-class least-squares SVM via ridge regression.
+
+    Outputs:
+      - theta: (n_classes x n_features)
+    """
     n_samples, n_features = X_train.shape
     classes = np.unique(y_train)
     n_classes = len(classes)
     Y = np.zeros((n_samples, n_classes))
     for ci, cls in enumerate(classes):
         Y[y_train == cls, ci] = 1
-    ridge = Ridge(alpha=1.0/C, fit_intercept=False, solver='auto')
+    ridge = Ridge(alpha=1.0 / C, fit_intercept=False, solver='auto')
     ridge.fit(X_train, Y)
     return ridge.coef_
 
+
 def influence_removal_ls_svm(X_train, y_train, theta_orig,
                              removal_indices: np.ndarray, C: float = 10.0):
+    """
+    Remove influence of given samples via influence-function Hessian solve.
+
+    Outputs:
+      - theta_unlearn: (n_classes x n_features)
+    """
     n_classes, n_features = theta_orig.shape
     grad_sum = np.zeros_like(theta_orig)
     for idx in removal_indices:
         x = X_train[idx].toarray().ravel()
-        one_hot = np.zeros(n_classes); one_hot[y_train[idx]] = 1
+        one_hot = np.zeros(n_classes)
+        one_hot[y_train[idx]] = 1
         scores = theta_orig.dot(x)
         error = scores - one_hot
         grad_sum += C * np.outer(error, x)
@@ -84,30 +98,45 @@ def influence_removal_ls_svm(X_train, y_train, theta_orig,
 
     return theta_unlearn
 
+
 def evaluate_accuracy(theta, vectorizer, docs: list, labels: np.ndarray):
+    """
+    Compute classification accuracy on docs with given theta.
+    """
     X = vectorizer.transform(docs)
     scores = X @ theta.T
     preds = np.argmax(scores, axis=1)
     return accuracy_score(labels, preds)
 
+
 def build_attack_features(P: np.ndarray, labels: np.ndarray):
+    """
+    Construct features for membership inference attack.
+
+    Returns:
+      - features: (n_samples x (n_classes + 3))
+    """
     entropy = -np.sum(P * np.log(P + 1e-12), axis=1, keepdims=True)
-    true_p = P[np.arange(len(labels)), labels].reshape(-1,1)
+    true_p = P[np.arange(len(labels)), labels].reshape(-1, 1)
     ce_loss = -np.log(true_p + 1e-12)
     top2 = np.sort(P, axis=1)[:, -2:]
-    gap = (top2[:,1] - top2[:,0]).reshape(-1,1)
+    gap = (top2[:, 1] - top2[:, 0]).reshape(-1, 1)
     return np.hstack([P, entropy, ce_loss, gap])
 
-def train_shadow_attack(theta_target, vectorizer, train_docs: list, train_labels: np.ndarray, C: float = 1.0):
+
+def train_shadow_attack(theta_target, vectorizer, train_docs: list,
+                        train_labels: np.ndarray, C: float = 1.0):
+    """
+    Train a shadow-model-based membership inference attack.
+    """
     s_docs, h_docs, s_lbls, h_lbls = train_test_split(
         train_docs, train_labels,
-        test_size=0.5,
-        random_state=0,
-        stratify=train_labels
+        test_size=0.5, random_state=0, stratify=train_labels
     )
     Xs, Xh = vectorizer.transform(s_docs), vectorizer.transform(h_docs)
     theta_sh = train_ls_svm(Xs, s_lbls, C)
-    Ps, Ph = softmax(Xs @ theta_sh.T, axis=1), softmax(Xh @ theta_sh.T, axis=1)
+    Ps = softmax(Xs @ theta_sh.T, axis=1)
+    Ph = softmax(Xh @ theta_sh.T, axis=1)
     A_s, A_h = build_attack_features(Ps, s_lbls), build_attack_features(Ph, h_lbls)
     X_att = np.vstack([A_s, A_h])
     y_att = np.concatenate([np.ones(len(s_lbls)), np.zeros(len(h_lbls))])
@@ -115,16 +144,28 @@ def train_shadow_attack(theta_target, vectorizer, train_docs: list, train_labels
     attack_clf.fit(X_att, y_att)
     return attack_clf
 
-def train_shadow_attack_with_unlearning(theta_target, vectorizer, train_docs: list, train_labels: np.ndarray, C: float, class_to_unlearn: int):
+
+def train_shadow_attack_with_unlearning(theta_target, vectorizer, train_docs: list,
+                                        train_labels: np.ndarray, C: float, class_to_unlearn: int):
+    """
+    Shadow attack training with in-shadow unlearning of class `class_to_unlearn`.
+    """
     s_docs, h_docs, s_lbls, h_lbls = train_test_split(
         train_docs, train_labels,
         test_size=0.5, random_state=0, stratify=train_labels
     )
     Xs, Xh = vectorizer.transform(s_docs), vectorizer.transform(h_docs)
+
+    # Train LS-SVM on shadow-train
     theta_sh = train_ls_svm(Xs, s_lbls, C)
+
+    # Unlearn class_to_unlearn in the shadow model
     rem = np.where(s_lbls == class_to_unlearn)[0]
     theta_sh_un = influence_removal_ls_svm(Xs, s_lbls, theta_sh, rem, C)
-    keep = np.ones(len(s_lbls), bool); keep[rem] = False
+
+    # Fine-tune on remaining shadow-train
+    keep = np.ones(len(s_lbls), bool)
+    keep[rem] = False
     Xs_red, y_sred = Xs[keep], s_lbls[keep]
     classes_red = np.unique(y_sred)
     theta_init = theta_sh_un[classes_red]
@@ -138,11 +179,13 @@ def train_shadow_attack_with_unlearning(theta_target, vectorizer, train_docs: li
     ft.classes_ = classes_red
     ft.fit(Xs_red, y_sred)
 
+    # Reconstruct full K×d shadow weight matrix (freeze removed class row=0)
     K, d = theta_sh.shape
     theta_sh_final = np.zeros((K, d))
     for i, c in enumerate(classes_red):
         theta_sh_final[c] = ft.coef_[i]
 
+    # Build attack dataset (same as standard)
     Ps = softmax(Xs @ theta_sh_final.T, axis=1)
     Ph = softmax(Xh @ theta_sh_final.T, axis=1)
     A_s, A_h = build_attack_features(Ps, s_lbls), build_attack_features(Ph, h_lbls)
@@ -153,9 +196,13 @@ def train_shadow_attack_with_unlearning(theta_target, vectorizer, train_docs: li
     attack_clf.fit(X_att, y_att)
     return attack_clf
 
+
 def compute_mia_auc(attack_clf, theta, vectorizer,
                     train_docs: list, train_labels: np.ndarray,
                     test_docs: list, test_labels: np.ndarray):
+    """
+    Compute ROC AUC for the membership inference attack.
+    """
     Xtr = vectorizer.transform(train_docs)
     Xte = vectorizer.transform(test_docs)
     Ptr = softmax(Xtr @ theta.T, axis=1)
@@ -164,11 +211,16 @@ def compute_mia_auc(attack_clf, theta, vectorizer,
     A_te = build_attack_features(Pte, test_labels)
     X_att = np.vstack([A_tr, A_te])
     y_att = np.concatenate([np.ones(len(train_labels)), np.zeros(len(test_labels))])
-    return roc_auc_score(y_att, attack_clf.predict_proba(X_att)[:,1])
+    return roc_auc_score(y_att, attack_clf.predict_proba(X_att)[:, 1])
 
-def compute_class_mia_auc(attack_clf, theta, vectorizer, train_docs, train_labels, test_docs, test_labels, cls: int):
+
+def compute_class_mia_auc(attack_clf, theta, vectorizer,
+                          train_docs, train_labels, test_docs, test_labels, cls: int):
+    """
+    ROC-AUC of the attack for membership inference on class `cls` only.
+    """
     train_idx = np.where(train_labels == cls)[0]
-    test_idx  = np.where(test_labels == cls)[0]
+    test_idx = np.where(test_labels == cls)[0]
     docs_tr_k = [train_docs[i] for i in train_idx]
     docs_te_k = [test_docs[i] for i in test_idx]
     labs_tr_k = train_labels[train_idx]
@@ -179,33 +231,66 @@ def compute_class_mia_auc(attack_clf, theta, vectorizer, train_docs, train_label
         docs_te_k, labs_te_k
     )
 
+
+
+def plot_margin_histograms(margins_before, margins_after, bins=50):
+    all_vals = np.concatenate([margins_before, margins_after])
+    bin_edges = np.linspace(np.min(all_vals), np.max(all_vals), bins + 1)
+
+    plt.figure()
+    plt.hist(margins_before, bins=bin_edges, alpha=0.75)
+    plt.title("Top-1 Probability Margin — BEFORE Unlearning")
+    plt.xlabel("P(true) − max P(other)")
+    plt.ylabel("Frequency")
+    plt.tight_layout()
+
+    plt.figure()
+    plt.hist(margins_after, bins=bin_edges, alpha=0.75)
+    plt.title("Top-1 Probability Margin — AFTER Unlearning")
+    plt.xlabel("P(true) − max P(other)")
+    plt.ylabel("Frequency")
+    plt.tight_layout()
+
+    plt.show()
+
+def compute_probs_and_margin(X, theta, labels):
+    logits = X @ theta.T                      # [N, K]
+    probs  = softmax(logits, axis=1)          # [N, K] true probabilities
+    preds  = np.argmax(probs, axis=1)         # [N]
+
+    n = probs.shape[0]
+    p_true = probs[np.arange(n), labels]      # [N]
+    probs_other = probs.copy()
+    probs_other[np.arange(n), labels] = -np.inf
+    p_other_max = np.max(probs_other, axis=1) # [N]
+
+    margins = p_true - p_other_max            # [N]
+    return probs, preds, margins
+
 def main():
-    # ===== 80/10/10 split =====
-    (train_docs, test_pre_docs, test_post_docs,
-     y_train, y_test_pre, y_test_post) = prepare_data_80_10_10()
+    # Data
+    train_docs, test_docs, y_train, y_test = prepare_data()
+    vectorizer, X_train, X_test = build_tfidf(train_docs, test_docs)
 
-    vectorizer, X_train, X_test_pre, X_test_post = build_tfidf(train_docs, test_pre_docs, test_post_docs)
-
-    # choose a class that actually exists in training
-    class_to_unlearn = int(np.random.choice(np.unique(y_train)))
+    # Pick a class to unlearn
+    class_to_unlearn = random.randint(0, max(y_train))
     C = 10.0
 
-    # ===== Baseline training & pre-unlearning evaluation =====
+    # ----- Baseline training & attack
     theta_orig = train_ls_svm(X_train, y_train, C)
-    acc_before = evaluate_accuracy(theta_orig, vectorizer, test_pre_docs, y_test_pre)
-
+    acc_before = evaluate_accuracy(theta_orig, vectorizer, test_docs, y_test)
     attack_clf_before = train_shadow_attack(theta_orig, vectorizer, train_docs, y_train, C)
     auc_before = compute_mia_auc(attack_clf_before, theta_orig, vectorizer,
-                                 train_docs, y_train, test_pre_docs, y_test_pre)
+                                 train_docs, y_train, test_docs, y_test)
     auc_before_cls = compute_class_mia_auc(attack_clf_before, theta_orig, vectorizer,
-                                           train_docs, y_train, test_pre_docs, y_test_pre,
+                                           train_docs, y_train, test_docs, y_test,
                                            cls=class_to_unlearn)
 
-    # ===== Unlearning the selected class =====
+    # ----- Unlearning of selected class
     removal_indices = np.where(y_train == class_to_unlearn)[0]
     theta_un = influence_removal_ls_svm(X_train, y_train, theta_orig, removal_indices, C)
 
-    # fine-tune on reduced set (freeze removed class row)
+    # Fine-tune on reduced set (freeze class_to_unlearn row)
     keep_mask = np.ones(len(y_train), bool)
     keep_mask[removal_indices] = False
     X_red, y_red = X_train[keep_mask], y_train[keep_mask]
@@ -221,35 +306,55 @@ def main():
     ft.classes_ = classes_red
     ft.fit(X_red, y_red)
 
-    # reconstruct full theta with zero row for removed class
+    # Reconstruct full theta with zero row for removed class
     n_classes, n_features = theta_orig.shape
     theta_final = np.zeros_like(theta_orig)
     for i, cls in enumerate(classes_red):
         theta_final[cls, :] = ft.coef_[i]
 
-    # ===== Post-unlearning evaluation on the second 10% =====
-    # (match your earlier convention: exclude the unlearned class when scoring)
-    test_post_keep = np.where(y_test_post != class_to_unlearn)[0]
-    test_post_docs_wo = [test_post_docs[i] for i in test_post_keep]
-    y_test_post_wo = y_test_post[test_post_keep]
+    # Retrain the attack on the new model
+    attack_clf_after = train_shadow_attack_with_unlearning(
+        theta_final, vectorizer, train_docs, y_train, C, class_to_unlearn
+    )
 
-    acc_after = evaluate_accuracy(theta_final, vectorizer, test_post_docs_wo, y_test_post_wo)
-
-    attack_clf_after = train_shadow_attack_with_unlearning(theta_final, vectorizer, train_docs, y_train, C, class_to_unlearn)
+    acc_after = evaluate_accuracy(theta_final, vectorizer, test_docs, y_test)
     auc_after = compute_mia_auc(attack_clf_after, theta_final, vectorizer,
-                                train_docs, y_train, test_post_docs, y_test_post)
+                                train_docs, y_train, test_docs, y_test)
     auc_after_cls = compute_class_mia_auc(attack_clf_after, theta_final, vectorizer,
-                                          train_docs, y_train, test_post_docs, y_test_post,
+                                          train_docs, y_train, test_docs, y_test,
                                           cls=class_to_unlearn)
 
+    # Also compute accuracy after excluding unlearned class from the test set
+    test_keep_idx = np.where(y_test != class_to_unlearn)[0]
+    test_docs_wo = [test_docs[i] for i in test_keep_idx]
+    y_test_wo = y_test[test_keep_idx]
+    acc_after_wo_unlearned = evaluate_accuracy(theta_final, vectorizer, test_docs_wo, y_test_wo)
+
     print(f"Class label unlearned: {class_to_unlearn}")
-    print(f"[Pre]  Accuracy (first 10%): {acc_before:.4f}")
-    print(f"[Pre]  MIA AUC (overall):    {auc_before:.4f}")
-    print(f"[Pre]  MIA AUC (class {class_to_unlearn}): {auc_before_cls:.4f}")
-    print()
-    print(f"[Post] Accuracy (second 10%, excluding class {class_to_unlearn}): {acc_after:.4f}")
-    print(f"[Post] MIA AUC (overall):    {auc_after:.4f}")
-    print(f"[Post] MIA AUC (class {class_to_unlearn}): {auc_after_cls:.4f}")
+    print(f"Accuracy before unlearning: {acc_before:.4f}")
+    print(f"MIA AUC before unlearning: {auc_before:.4f}")
+    print(f"MIA AUC before unlearning (class {class_to_unlearn}): {auc_before_cls:.4f}\n")
+    print(f"Accuracy after unlearning (overall): {acc_after:.4f}")
+    print(f"Accuracy after unlearning (excluding class {class_to_unlearn} in test): {acc_after_wo_unlearned:.4f}")
+    print(f"Overall MIA AUC after unlearning: {auc_after:.4f}")
+    print(f"MIA AUC after unlearning (class {class_to_unlearn}): {auc_after_cls:.4f}")
+
+
+
+    Xte = vectorizer.transform(test_docs)
+
+    # BEFORE
+    probs_before, preds_before, margins_before = compute_probs_and_margin(Xte, theta_orig, y_test)
+
+    print(probs_before)
+
+    # AFTER
+    probs_after, preds_after, margins_after = compute_probs_and_margin(Xte, theta_final, y_test)
+
+    keep_idx = np.where(y_test != class_to_unlearn)[0]
+    margins_after = margins_after[keep_idx]
+    plot_margin_histograms(margins_before, margins_after, bins=50)
+
 
 if __name__ == "__main__":
     main()
